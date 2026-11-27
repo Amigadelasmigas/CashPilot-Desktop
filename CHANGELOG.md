@@ -7,9 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-28
+
 ### Added
 
 - **Settings has a Language picker, and Desktop starts in your computer's language when it ships it.** Desktop reads the OS language list first: the display languages on Windows, then the user locale; AppleLanguages on macOS, which a per-app choice or `-AppleLanguages '(es)'` overrides; LANGUAGE, LC_ALL, LC_MESSAGES and LANG on Linux. The webview's languages come after. The first language we ship wins, matched by language and then region: es-MX gets Spanish, pt-PT gets Brazilian Portuguese, zh-TW gets Simplified Chinese. A choice in Settings is saved in `config.json` as `language` and applies at once, without a restart. The picker shows each language in its own name. The frontend and Go read the same file per locale, `frontend/src/locales/<code>.json`, with ICU plurals. A missing translation shows English. A translation of English that has changed since shows English too, by the source hash in `i18n/source-hashes/`. Arabic draws right to left, and amounts and times follow the language. This release adds the machinery and the picker; the screens move to the locale files next.
+- **Windows: the Secure VM engine can build the VM, prove its network fence and remove it.** The window has no Secure VM button yet. This release adds the elevated roles it will use. Setup makes a Hyper-V VM with its own switch, NAT, firewall rule and vTPM, installs Windows from your ISO without a key prompt, and checks that the VM reaches the internet but not your network, your router or this PC. Remove takes off only what Setup made and lists everything it keeps and why. It keeps the vTPM guardian's two certificates, which a copy or backup of the VM needs to start, and says where they are. Windows allows one NAT network per PC, so Setup refuses to start while another NAT exists and names it. Setup writes `setup.log` in the VM's data folder, and a Remove that does not finish writes `remove.log` there.
 
 ### Fixed
 
