@@ -28,6 +28,7 @@ import (
 	"github.com/GeiserX/CashPilot-Desktop/internal/exchange"
 	"github.com/GeiserX/CashPilot-Desktop/internal/health"
 	"github.com/GeiserX/CashPilot-Desktop/internal/i18n"
+	"github.com/GeiserX/CashPilot-Desktop/internal/imageupdates"
 	"github.com/GeiserX/CashPilot-Desktop/internal/preflight"
 	"github.com/GeiserX/CashPilot-Desktop/internal/runtime"
 	"github.com/GeiserX/CashPilot-Desktop/internal/services"
@@ -38,6 +39,8 @@ import (
 
 type App struct {
 	ctx context.Context
+	// imageUpdateHolds are the builds an app image update undid while the app runs.
+	imageUpdateHolds imageupdates.Holds
 	// startErr holds the error that stopped startCore, so ready() can report it
 	// instead of errStillStarting, which the window would wait on.
 	startErr   atomic.Pointer[error]
@@ -265,6 +268,8 @@ func (a *App) startCore(ctx context.Context) error {
 	// Which fence-gated earners the user stopped, so CashPilot does not start them
 	// again. A file, read on every check, so the window and the daemon share it.
 	docker.SetGatedStoppedFile(filepath.Join(cfg.DataDir(), "fence_gated_stopped"))
+	// Marks of image updates still in their check period, read by RecoverSetAside.
+	docker.SetSettlingDir(filepath.Join(cfg.DataDir(), "image_update_settling"))
 	docker.SetIsolationMemory(
 		func() bool { return a.cfg.Config().IsolationOn },
 		func(on bool) {
@@ -333,6 +338,8 @@ func (a *App) startCore(ctx context.Context) error {
 	a.startDeviceLinkRetry(ctx)
 	// What each earner talks to, when the owner switched Activity on.
 	a.startActivitySampler(ctx)
+	// New builds of the apps' images, once a day (app_image_updates.go).
+	a.startImageUpdates(ctx)
 	// Resolve an interrupted Windows rule change before opening the worker API.
 	if a.window {
 		a.recoverServerCommandsFirewall()
@@ -2206,6 +2213,7 @@ func (a *App) notifications(status runtime.Status, earnings []store.EarningsReco
 	items = append(items, a.proxyNotifications()...)
 	items = append(items, a.activityNotifications()...)
 	items = append(items, a.stallNotifications()...)
+	items = append(items, a.imageUpdateNotifications(deployments)...)
 	if len(deployments) == 0 {
 		items = append(items, Notification{Level: "info", Title: i18n.T("go.app.notify.noServices.title"), Message: i18n.T("go.app.notify.noServices.message")})
 	}

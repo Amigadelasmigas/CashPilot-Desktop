@@ -104,6 +104,7 @@ import {
   GetLanguageState,
   SetLanguage,
 } from "../wailsjs/go/main/App";
+import { GetImageUpdates, RunImageUpdates, SaveImageUpdates } from "../wailsjs/go/main/App";
 import { currentLocale, ht, setLocale, t, textDirection } from "./render/i18n";
 import { renderLanguageCard } from "./render/language";
 import { renderFleetSection } from "./render/fleet";
@@ -119,6 +120,7 @@ import { fleetRedrawIsCurrent, keepsLiveProxyEditor, proxyValuesFrom, renderProx
 import { renderActivityPage } from "./render/activity";
 import { attentionItems, renderAttention } from "./render/attention";
 import { renderReminders, withReminders } from "./render/reminders";
+import { ImageUpdateEdits, draftOf, drawsOver, renderImageUpdatesCard } from "./render/imageupdates";
 import { stallItems } from "./render/stall";
 import { adminConsentScreen, cancelledText, deployErrorText, deployNotice, renderDeployFeedback, runCheckedDeploy, runDeployWithStatus, type DeployAnswer, type DeployFeedback, type DeployStatus } from "./render/deploy_consent";
 import { serviceFormFields } from "./render/fields";
@@ -388,6 +390,12 @@ function wireBackendEvents() {
   });
   // Background/startup failures the Go side reports via app:error had no listener,
   // so ~every background error was silently dropped. Surface them to the user.
+  // A finished run can change the bell too (an undone or a new build), so the
+  // app state is read again on every page.
+  EventsOn("imageupdates:changed", () => {
+    void onBackendEvent();
+    if (activeView === "settings") void loadImageUpdates();
+  });
   EventsOn("app:error", (payload) => showErrorToast(payload));
   EventsOn("app:notice", (payload) => showInfoToast(payload));
   // Windows reopened CashPilot after a restart while this window was open.
@@ -1839,6 +1847,7 @@ async function renderSettings(current: AppState) {
   // A redraw on this page (a language change, the background-helper toggle)
   // keeps what the user typed and did not save yet.
   const drafts = drawnSettingFields();
+  const imageDraft = imageUpdateDraft();
   // The consents are read from the live state, not from `current`: a Withdraw
   // during the awaits above already changed them, and drawing the older map would
   // bring the withdrawn row back.
@@ -1876,6 +1885,8 @@ async function renderSettings(current: AppState) {
             </div>
           </section>
 
+          <div id="image-updates-slot"></div>
+
           <section class="card">
             <div class="card-header">
               <div>
@@ -1897,6 +1908,7 @@ async function renderSettings(current: AppState) {
     </div>
   `);
   restoreSettingDrafts(drafts);
+  void loadImageUpdates(imageDraft);
   wireChrome();
   wireShellNav();
   maybeResetScroll();
@@ -1910,6 +1922,92 @@ async function renderSettings(current: AppState) {
   document.querySelectorAll<HTMLButtonElement>("[data-service]").forEach((button) => {
     button.addEventListener("click", () => openWizard(button.dataset.service));
   });
+}
+
+// Settings > App image updates (render/imageupdates.ts). A reload draws the card
+// again only when every choice the owner changed is saved; a redraw of the whole
+// page carries the unsaved ones over (imageUpdateDraft).
+const imageUpdateEdits = new ImageUpdateEdits();
+
+function imageUpdateDraft(): Record<string, string> | null {
+  if (imageUpdateEdits.canRedraw()) return null;
+  const selects = document.querySelectorAll<HTMLSelectElement>("#image-updates-slot select");
+  return draftOf([...selects].map((el): [string, string] => [el.id || `app:${el.dataset.imageUpdatesApp}`, el.value]));
+}
+
+async function loadImageUpdates(draft: Record<string, string> | null = null) {
+  imageUpdateEdits.holdDraft(draft);
+  const load = imageUpdateEdits.beginLoad();
+  let html: string;
+  let failed = false;
+  try {
+    html = renderImageUpdatesCard(await GetImageUpdates());
+  } catch (error) {
+    html = renderImageUpdatesCard(null, String(error));
+    failed = true;
+  }
+  // A newer load started meanwhile: its answer is the one to draw.
+  if (!imageUpdateEdits.isLatest(load)) return;
+  const slot = document.querySelector<HTMLElement>("#image-updates-slot");
+  if (!slot) return;
+  // A card on screen stays when a change on it is not saved yet, and when a
+  // reload failed. An error card gives way to the next answer.
+  const shown = slot.childElementCount === 0 ? "empty" : slot.querySelector("[data-image-updates-error]") ? "error" : "card";
+  if (!drawsOver(shown, failed, imageUpdateEdits.canRedraw())) return;
+  slot.innerHTML = html;
+  // An error card has no choices: the draft waits for the card.
+  const kept = failed ? null : imageUpdateEdits.takeDraft();
+  if (kept) {
+    slot.querySelectorAll<HTMLSelectElement>("select").forEach((el) => {
+      const key = el.id || `app:${el.dataset.imageUpdatesApp}`;
+      if (key in kept) el.value = kept[key];
+    });
+  }
+  if (slot.dataset.wired) return;
+  slot.dataset.wired = "1";
+  slot.addEventListener("change", () => imageUpdateEdits.change());
+  slot.addEventListener("click", (event) => {
+    const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-image-updates-action]");
+    if (!button) return;
+    const action = button.dataset.imageUpdatesAction;
+    if (action === "save") void saveImageUpdates();
+    else if (action === "enable") void saveImageUpdates("auto");
+    else if (action === "run") void runImageUpdatesNow();
+  });
+}
+
+async function saveImageUpdates(mode?: string) {
+  const slot = document.querySelector<HTMLElement>("#image-updates-slot");
+  if (!slot) return;
+  const apps: Record<string, string> = {};
+  slot.querySelectorAll<HTMLSelectElement>("[data-image-updates-app]").forEach((el) => {
+    apps[el.dataset.imageUpdatesApp || ""] = el.value;
+  });
+  const modeSelect = slot.querySelector<HTMLSelectElement>("#image-updates-mode");
+  // Enable saves Update automatically: the select shows it too, so a page
+  // redraw before the answer carries that choice, not the old one.
+  if (mode && modeSelect) modeSelect.value = mode;
+  const chosen = mode || modeSelect?.value || "off";
+  const hour = Number(slot.querySelector<HTMLSelectElement>("#image-updates-hour")?.value ?? 4);
+  const sent = imageUpdateEdits.sent();
+  try {
+    await SaveImageUpdates(chosen, hour, apps);
+    imageUpdateEdits.saved(sent);
+    showInfoToast({ scope: "image updates", message: t("imageUpdates.saved") });
+  } catch (error) {
+    showErrorToast({ scope: "image updates", error: String(error) });
+  }
+  await loadImageUpdates();
+}
+
+async function runImageUpdatesNow() {
+  try {
+    await RunImageUpdates();
+    showInfoToast({ scope: "image updates", message: t("imageUpdates.started") });
+  } catch (error) {
+    showErrorToast({ scope: "image updates", error: String(error) });
+  }
+  await loadImageUpdates();
 }
 
 // Settings > How this computer runs: each switch shows its confirm screen first.

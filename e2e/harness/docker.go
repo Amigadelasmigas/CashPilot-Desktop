@@ -29,6 +29,9 @@ import (
 type Mount struct {
 	Source string
 	Target string
+	// Anonymous is a volume Docker made for an image's VOLUME path: a removal
+	// with v=1 deletes it, as Docker does.
+	Anonymous bool
 }
 
 // Container is one container the fake daemon is holding, as the tests want to
@@ -73,6 +76,13 @@ type Container struct {
 	// grant), as the create sent them.
 	DeviceRequests []DeviceRequest
 	Devices        []string
+	// ImageID is the ID of the build the container was created from, which
+	// inspect reports as its Image, as Docker does (SetImage).
+	ImageID string
+	// RestartCount and Health are what inspect reports: how often Docker
+	// restarted it, and its image health check's status ("" for none).
+	RestartCount int
+	Health       string
 }
 
 // DeviceRequest is one HostConfig device request (an NVIDIA GPU).
@@ -147,6 +157,108 @@ type Docker struct {
 	// created is every container ever created, as it was created, removed ones
 	// included (Created).
 	created []Container
+	// builds are what SetImage made of a reference: the build a pull of it gets.
+	// crashing holds the build IDs whose containers Docker restarts right after
+	// each start (SetCrashing). removedImages lists every image deleted.
+	builds        map[string]Build
+	byID          map[string]Build
+	imageVolumes  map[string][]string
+	crashing      map[string]bool
+	removedImages []string
+	// deleted holds the build IDs deleted and not pulled again: an inspect or a
+	// create of one answers that the image is missing, as Docker does.
+	deleted map[string]bool
+	// onImageInspect runs after each image inspect is answered (OnImageInspect).
+	onImageInspect func(ref string)
+	// failLogs makes every log read answer a server error (FailLogs).
+	failLogs bool
+}
+
+// Build is the image a reference points at: its ID and its registry digest.
+type Build struct {
+	ID     string
+	Digest string
+	// Repo is the repository of the reference SetImage named, so an inspect by
+	// image ID or by a digest reference still names the right repository.
+	Repo string
+}
+
+// SetImage points ref (repository:tag) at a build, as a registry moving a tag
+// does: the next pull and inspect of ref get it. Without it a ref's ID is
+// "sha256:" plus the ref.
+func (d *Docker) SetImage(ref, id, digest string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.builds == nil {
+		d.builds, d.byID = map[string]Build{}, map[string]Build{}
+	}
+	b := Build{ID: id, Digest: digest, Repo: repoOf(ref)}
+	d.builds[ref] = b
+	// Docker keeps a build when its tag moves on: the containers made from it
+	// still resolve to it by ID.
+	d.byID[id] = b
+}
+
+// SetImageVolumes makes build id declare VOLUME paths, as an image's Dockerfile
+// does: each container of it gets an anonymous volume at each path that its
+// create did not mount.
+func (d *Docker) SetImageVolumes(id string, paths ...string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.imageVolumes == nil {
+		d.imageVolumes = map[string][]string{}
+	}
+	d.imageVolumes[id] = paths
+}
+
+// OnImageInspect runs fn after each image inspect is answered, outside the lock:
+// a test moves a tag there, between a deploy's check of the image and its create.
+func (d *Docker) OnImageInspect(fn func(ref string)) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.onImageInspect = fn
+}
+
+// SetCrashing makes every container of build id crash after each start: Docker
+// restarts it, so inspect shows a restart count.
+func (d *Docker) SetCrashing(id string, crash bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.crashing == nil {
+		d.crashing = map[string]bool{}
+	}
+	d.crashing[id] = crash
+}
+
+// SetHealth sets a container's image health check status ("unhealthy").
+func (d *Docker) SetHealth(name, status string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if c := d.find(name); c != nil {
+		c.Health = status
+	}
+}
+
+// RemovedImages lists the images deleted, in order.
+func (d *Docker) RemovedImages() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.removedImages...)
+}
+
+// build is the build ref names. The caller holds the lock.
+func (d *Docker) build(ref string) Build {
+	if b, ok := d.builds[ref]; ok {
+		return b
+	}
+	if b, ok := d.byID[ref]; ok {
+		return b
+	}
+	if strings.HasPrefix(ref, "sha256:") {
+		// An image ID names itself, as the default build of a tag does.
+		return Build{ID: ref}
+	}
+	return Build{ID: "sha256:" + ref}
 }
 
 // NewDocker starts the fake daemon on a loopback TCP port.
@@ -197,6 +309,14 @@ func (d *Docker) SetPullError(message string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.pullError = message
+}
+
+// FailLogs makes a log read of an app's container answer a server error, as a
+// daemon that cannot read its log does. The fence and wallet helpers still answer.
+func (d *Docker) FailLogs(fail bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.failLogs = fail
 }
 
 // SetLogs replaces the log text the fake streams back.
@@ -363,6 +483,8 @@ func (d *Docker) handle(w http.ResponseWriter, r *http.Request) {
 		})
 	case path == "/images/create":
 		d.pull(w, r)
+	case strings.HasPrefix(path, "/images/") && r.Method == http.MethodDelete:
+		d.removeImage(w, strings.TrimPrefix(path, "/images/"))
 	case strings.HasPrefix(path, "/images/") && strings.HasSuffix(path, "/json"):
 		d.image(w, strings.TrimSuffix(strings.TrimPrefix(path, "/images/"), "/json"))
 	case path == "/containers/create":
@@ -397,6 +519,8 @@ func (d *Docker) pull(w http.ResponseWriter, r *http.Request) {
 	d.pullError = ""
 	if failure == "" {
 		d.images = append(d.images, image)
+		// The registry still has the build: a pull brings a deleted one back.
+		delete(d.deleted, d.build(image).ID)
 	}
 	d.mu.Unlock()
 
@@ -419,10 +543,57 @@ func (d *Docker) pull(w http.ResponseWriter, r *http.Request) {
 // daemon set down after the pull, a digest ref) still reaches the same steps a
 // real daemon would.
 func (d *Docker) image(w http.ResponseWriter, ref string) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"Id":     "sha256:" + ref,
+	d.mu.Lock()
+	b := d.build(ref)
+	after := d.onImageInspect
+	gone := d.deleted[b.ID]
+	d.mu.Unlock()
+	if after != nil {
+		defer after(ref)
+	}
+	if gone {
+		writeJSON(w, http.StatusNotFound, map[string]string{"message": "No such image: " + ref})
+		return
+	}
+	answer := map[string]any{
+		"Id":     b.ID,
 		"Config": map[string]any{"Entrypoint": []string{"entrypoint"}},
-	})
+	}
+	if b.Digest != "" {
+		repo := b.Repo
+		if repo == "" {
+			repo = repoOf(ref)
+		}
+		answer["RepoDigests"] = []string{repo + "@" + b.Digest}
+	}
+	writeJSON(w, http.StatusOK, answer)
+}
+
+// repoOf is the repository of an image reference, without its tag or digest.
+func repoOf(ref string) string {
+	repo, _, _ := strings.Cut(ref, "@")
+	if i := strings.LastIndex(repo, ":"); i > strings.LastIndex(repo, "/") {
+		repo = repo[:i]
+	}
+	return repo
+}
+
+// removeImage deletes an image no container uses, as Docker does without force.
+func (d *Docker) removeImage(w http.ResponseWriter, id string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, c := range d.containers {
+		if c.ImageID == id {
+			writeJSON(w, http.StatusConflict, map[string]string{"message": "conflict: unable to delete " + id + " - image is being used by running container " + c.ID})
+			return
+		}
+	}
+	d.removedImages = append(d.removedImages, id)
+	if d.deleted == nil {
+		d.deleted = map[string]bool{}
+	}
+	d.deleted[d.build(id).ID] = true
+	writeJSON(w, http.StatusOK, []map[string]string{{"Deleted": id}})
 }
 
 func (d *Docker) create(w http.ResponseWriter, r *http.Request) {
@@ -476,11 +647,16 @@ func (d *Docker) create(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if d.deleted[d.build(body.Image).ID] {
+		writeJSON(w, http.StatusNotFound, map[string]string{"message": "No such image: " + body.Image})
+		return
+	}
 	d.nextID++
 	c := &Container{
 		ID:          fmt.Sprintf("ctr%09d", d.nextID),
 		Name:        name,
 		Image:       body.Image,
+		ImageID:     d.build(body.Image).ID,
 		State:       "created",
 		Labels:      body.Labels,
 		Env:         body.Env,
@@ -506,11 +682,22 @@ func (d *Docker) create(w http.ResponseWriter, r *http.Request) {
 		delete(d.refuseNextStart, name)
 		c.refuseStart = why
 	}
+	// Every mounted path, binds included: an image VOLUME at one of them gets
+	// no anonymous volume.
+	mounted := map[string]bool{}
 	for _, m := range body.HostConfig.Mounts {
+		mounted[m.Target] = true
 		if m.Type == "volume" && m.Source != "" {
 			c.Mounts = append(c.Mounts, Mount{Source: m.Source, Target: m.Target})
 			// The daemon creates a named volume on first use.
 			d.volumes[m.Source] = true
+		}
+	}
+	for _, p := range d.imageVolumes[c.ImageID] {
+		if !mounted[p] {
+			anon := fmt.Sprintf("%064x", d.nextID*1000+len(c.Mounts))
+			c.Mounts = append(c.Mounts, Mount{Source: anon, Target: p, Anonymous: true})
+			d.volumes[anon] = true
 		}
 	}
 	if name == "" {
@@ -596,6 +783,11 @@ func (d *Docker) container(w http.ResponseWriter, r *http.Request, rest string) 
 		text := d.logs
 		c := d.find(id)
 		found := c != nil
+		if found && d.failLogs && c.Labels["cashpilot.probe"] == "" && c.Labels["cashpilot.wallet-helper"] == "" {
+			d.mu.Unlock()
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "cannot read the log"})
+			return
+		}
 		if found && c.Labels["cashpilot.probe"] == "fence" {
 			// The LAN fence helper prints one JSON result: the table is in place.
 			text = `{"backend":"nft","ok":true,"changed":true,"error":"","present":true,"matches":true,"counters":{}}` + "\n"
@@ -626,7 +818,7 @@ func (d *Docker) container(w http.ResponseWriter, r *http.Request, rest string) 
 	case action == "rename" && r.Method == http.MethodPost:
 		d.rename(w, id, r.URL.Query().Get("name"))
 	case action == "" && r.Method == http.MethodDelete:
-		d.remove(w, id, r.URL.Query().Get("force") == "1")
+		d.remove(w, id, r.URL.Query().Get("force") == "1", r.URL.Query().Get("v") == "1")
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"message": "fake daemon: no container route " + rest})
 	}
@@ -644,13 +836,18 @@ func (d *Docker) inspect(w http.ResponseWriter, id string) {
 	for _, m := range c.Mounts {
 		mounts = append(mounts, map[string]any{"Type": "volume", "Name": m.Source, "Destination": m.Target, "RW": true})
 	}
+	state := map[string]any{"Status": c.State, "Running": c.State == "running", "Restarting": c.State == "restarting", "Error": c.StateError}
+	if c.Health != "" {
+		state["Health"] = map[string]any{"Status": c.Health}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"Id":     c.ID,
-		"Name":   "/" + c.Name,
-		"Image":  c.Image,
-		"State":  map[string]any{"Status": c.State, "Running": c.State == "running", "Error": c.StateError},
-		"Config": map[string]any{"Image": c.Image, "Labels": c.Labels, "Env": c.Env, "Cmd": c.Cmd},
-		"Mounts": mounts,
+		"Id":           c.ID,
+		"Name":         "/" + c.Name,
+		"Image":        c.ImageID,
+		"RestartCount": c.RestartCount,
+		"State":        state,
+		"Config":       map[string]any{"Image": c.Image, "Labels": c.Labels, "Env": c.Env, "Cmd": c.Cmd},
+		"Mounts":       mounts,
 		"HostConfig": map[string]any{
 			"NetworkMode": c.NetworkMode, "Runtime": c.Runtime, "PortBindings": c.PortBindings,
 			"RestartPolicy": map[string]any{"Name": c.RestartPolicy},
@@ -866,6 +1063,9 @@ func (d *Docker) setState(w http.ResponseWriter, id, state string) {
 	c.State = state
 	if state == "running" {
 		c.StateError = ""
+		if d.crashing[c.ImageID] {
+			c.RestartCount++
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -932,7 +1132,7 @@ func (d *Docker) SetRestartPolicy(name, policy string) {
 	}
 }
 
-func (d *Docker) remove(w http.ResponseWriter, id string, force bool) {
+func (d *Docker) remove(w http.ResponseWriter, id string, force, volumes bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	c := d.find(id)
@@ -946,7 +1146,14 @@ func (d *Docker) remove(w http.ResponseWriter, id string, force bool) {
 		return
 	}
 	// A named volume survives its container, exactly as the real daemon leaves it:
-	// only an explicit volume delete removes it.
+	// only an explicit volume delete removes it. v=1 takes the anonymous ones.
+	if volumes {
+		for _, m := range c.Mounts {
+			if m.Anonymous {
+				delete(d.volumes, m.Source)
+			}
+		}
+	}
 	delete(d.containers, c.Name)
 	w.WriteHeader(http.StatusNoContent)
 }

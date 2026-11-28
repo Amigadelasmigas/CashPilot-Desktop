@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 
 	"github.com/GeiserX/CashPilot-Desktop/internal/runtime"
 )
@@ -43,4 +44,28 @@ func (m *Manager) ContainerDrift(ctx context.Context) map[string][]string {
 		}
 	}
 	return out
+}
+
+// LooseMounts is, per container ID of an app, the folders it keeps outside
+// what a redeploy mounts (see runtime.LooseMounts). Every container that was
+// read has a key, with no folders when it has none; one that could not be read
+// has none. An error means nothing was read.
+func (m *Manager) LooseMounts(ctx context.Context) (map[string][]string, error) {
+	reader, ok := m.providers[m.defaultKind].(shapeReader)
+	if !ok || m.catalog == nil {
+		return nil, errors.New("this runtime cannot say how its containers were created")
+	}
+	shapes, err := reader.ContainerShapes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string][]string{}
+	for _, shape := range shapes {
+		svc, found := m.catalog.Get(shape.Slug)
+		if !found {
+			continue
+		}
+		out[shape.ID] = runtime.LooseMounts(svc, shape)
+	}
+	return out, nil
 }

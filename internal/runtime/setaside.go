@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -52,7 +53,7 @@ func (p *DockerProvider) RecoverSetAside(ctx context.Context) {
 		if base, ok := setAsideBase(firstName(c.Names), c.Labels); ok {
 			// Not while a deploy of the same container runs (lockReplacing).
 			unlock := p.lockReplacing(base)
-			_, _ = recoverSetAside(ctx, cli, base)
+			_, _ = p.recoverSetAside(ctx, cli, base)
 			unlock()
 		}
 	}
@@ -62,10 +63,21 @@ func (p *DockerProvider) RecoverSetAside(ctx context.Context) {
 // left one of this copy of this service:
 //   - nothing holds name: the old container gets its name back, stopped;
 //   - a replacement that never started holds it: that one goes, the old one comes back;
+//   - an image update's check period did not finish (settling.go): the replacement
+//     goes, made, running or gone, and the old one comes back and runs again;
 //   - a replacement that started holds it: the old container goes, its volumes stay.
 //
 // Anything not ours is left alone. The note says what was done, "" for nothing.
-func recoverSetAside(ctx context.Context, cli *client.Client, name string) (string, error) {
+func (p *DockerProvider) recoverSetAside(ctx context.Context, cli *client.Client, name string) (string, error) {
+	note, err := recoverSetAside(ctx, cli, name, p.settling.pending(name))
+	if err == nil {
+		// Settled: a mark left with it is of a deploy that is over.
+		_ = p.settling.clear(name)
+	}
+	return note, err
+}
+
+func recoverSetAside(ctx context.Context, cli *client.Client, name string, unchecked bool) (string, error) {
 	aside := name + setAsideSuffix
 	left, err := cli.ContainerInspect(ctx, aside, client.ContainerInspectOptions{})
 	if cerrdefs.IsNotFound(err) {
@@ -82,6 +94,7 @@ func recoverSetAside(ctx context.Context, cli *client.Client, name string) (stri
 		return "", nil
 	}
 	held, err := cli.ContainerInspect(ctx, name, client.ContainerInspectOptions{})
+	found := err == nil
 	switch {
 	case cerrdefs.IsNotFound(err):
 	case err != nil:
@@ -89,13 +102,35 @@ func recoverSetAside(ctx context.Context, cli *client.Client, name string) (stri
 	case held.Container.Config == nil || held.Container.Config.Labels[LabelService] != labels[LabelService] ||
 		instanceOf(held.Container.Config.Labels) != instanceOf(labels):
 		return "", nil
-	case held.Container.State == nil || held.Container.State.Status != container.StateCreated:
-		// Not forced: one that runs is not a leftover.
-		if _, err := cli.ContainerRemove(ctx, left.Container.ID, client.ContainerRemoveOptions{}); err != nil {
-			return "", fmt.Errorf("%s: %w", i18n.T("go.runtime.aside.removeLeftFailed", "name", aside), err)
+	}
+	if unchecked {
+		// Its check never passed: the replacement goes, made, running or gone, and the
+		// old container comes back. An update replaces only one that ran, so it runs
+		// again; a fence-gated one is left to the fence guard, which starts it behind
+		// the fence.
+		if found {
+			if _, err := cli.ContainerRemove(ctx, held.Container.ID, client.ContainerRemoveOptions{Force: true}); err != nil {
+				return "", fmt.Errorf("%s: %w", i18n.T("go.runtime.aside.removeUncheckedFailed", "name", name), err)
+			}
 		}
-		return i18n.T("go.runtime.aside.removedLeft", "name", aside), nil
-	default:
+		if _, err := cli.ContainerRename(ctx, left.Container.ID, client.ContainerRenameOptions{NewName: name}); err != nil {
+			return "", fmt.Errorf("%s: %w", i18n.T("go.runtime.aside.putBackFailed", "aside", aside, "name", name), err)
+		}
+		if labels[LabelFenceGated] != "true" {
+			if _, err := cli.ContainerStart(ctx, left.Container.ID, client.ContainerStartOptions{}); err != nil {
+				return "", errors.New(i18n.T("go.runtime.aside.previousNotStarted", "error", err))
+			}
+		}
+		return i18n.T("go.runtime.aside.updateUndone", "name", name), nil
+	}
+	if found {
+		if held.Container.State == nil || held.Container.State.Status != container.StateCreated {
+			// Not forced: one that runs is not a leftover.
+			if _, err := cli.ContainerRemove(ctx, left.Container.ID, client.ContainerRemoveOptions{}); err != nil {
+				return "", fmt.Errorf("%s: %w", i18n.T("go.runtime.aside.removeLeftFailed", "name", aside), err)
+			}
+			return i18n.T("go.runtime.aside.removedLeft", "name", aside), nil
+		}
 		if _, err := cli.ContainerRemove(ctx, held.Container.ID, client.ContainerRemoveOptions{}); err != nil {
 			return "", fmt.Errorf("%s: %w", i18n.T("go.runtime.aside.removeUnstartedFailed", "name", name), err)
 		}
