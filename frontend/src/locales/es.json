@@ -798,7 +798,7 @@
   "go.app.lead.ask.replaceNamed": "¿Volver a desplegar {name} en {worker}? El contenedor actual ({container}) se sustituirá, pero sus volúmenes se conservan.",
   "go.app.lead.thisComputer": "este ordenador",
   "go.app.lead.unknownCommand": "comando desconocido {command}: usa stop, start, restart o remove",
-  "go.app.lead.commandDone": "{instance, plural, =1 {{slug}} other {La copia {instance} de {slug}}} en {worker} {command, select, stop {se detuvo} start {se inició} restart {se reinició} other {se quitó; sus datos se conservan para un despliegue posterior}}.",
+  "go.app.lead.commandDone": "{instance, plural, =1 {{slug}} other {La copia {instance} de {slug}}} {command, select, stop {se detuvo} start {se inició} restart {se reinició} other {se quitó; sus datos se conservan para un despliegue posterior}}.",
   "go.app.mode.firstRunOver": "la primera ejecución ya terminó; cámbialo en Ajustes, en Cómo funciona este ordenador",
   "go.app.mode.alreadyJoined": "este ordenador ya está unido a un CashPilot; primero cambia a Ejecutarlo todo aquí",
   "go.app.mode.savePairingFailed": "guardando el emparejamiento",
